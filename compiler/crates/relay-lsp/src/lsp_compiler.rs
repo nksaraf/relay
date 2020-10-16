@@ -16,13 +16,10 @@ use relay_compiler::FileSourceSubscription;
 use relay_compiler::{build_schema, check_project, GraphQLAsts, Programs};
 use schema::Schema;
 
-use common::{PerfLogEvent, PerfLogger};
-use interner::{Intern, StringKey};
+use common::{DiagnosticsResult, PerfLogEvent, PerfLogger};
+use interner::StringKey;
 
-use crate::completion::{
-    completion_items_for_request, get_completion_request, send_completion_response,
-    GraphQLSourceCache,
-};
+use crate::completion::GraphQLSourceCache;
 
 use crate::error_reporting::{report_build_project_errors, report_syntax_errors};
 use crate::state::ServerState;
@@ -33,7 +30,6 @@ use crate::text_documents::{
 use crate::error::{LSPError, Result};
 
 use common::ConsoleLogger;
-use log::info;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Receiver;
 
@@ -109,6 +105,8 @@ impl<'schema, 'config> LSPCompiler<'schema, 'config> {
                         CompilerError::EmptyQueryResult => {}
                         CompilerError::FileRead { .. } => {}
                         CompilerError::Syntax { .. } => {}
+                        CompilerError::JoinError { .. } => {}
+                        CompilerError::PostArtifactsError { .. } => {}
                     }
                 } else {
                     // TODO(brandondail) log here
@@ -158,7 +156,8 @@ impl<'schema, 'config> LSPCompiler<'schema, 'config> {
     fn on_lsp_bridge_message(&mut self, message: LSPBridgeMessage) {
         match message {
             // Completion request
-            LSPBridgeMessage::CompletionRequest { params, request_id } => {
+            LSPBridgeMessage::CompletionRequest { .. } => {
+                /* TODO: Re-enable auto-complete
                 if let Some(completion_request) =
                     get_completion_request(params, &self.synced_graphql_documents)
                 {
@@ -175,6 +174,7 @@ impl<'schema, 'config> LSPCompiler<'schema, 'config> {
                         }
                     }
                 }
+                */
             }
             LSPBridgeMessage::DidOpenTextDocument(params) => {
                 on_did_open_text_document(params, &mut self.synced_graphql_documents);
@@ -192,22 +192,22 @@ impl<'schema, 'config> LSPCompiler<'schema, 'config> {
         config: &Config,
         compiler_state: &CompilerState,
         setup_event: &impl PerfLogEvent,
-    ) -> SchemaMap {
+    ) -> DiagnosticsResult<SchemaMap> {
         let timer = setup_event.start("build_schemas");
         let mut schemas = HashMap::new();
         for project_config in config.enabled_projects() {
-            let schema = Arc::new(build_schema(compiler_state, project_config));
-            schemas.insert(project_config.name, schema);
+            let schema = build_schema(compiler_state, project_config)?;
+            schemas.insert(project_config.name, Arc::new(schema));
         }
         setup_event.stop(timer);
-        schemas
+        Ok(schemas)
     }
 
     async fn check_projects(&mut self, setup_event: &impl PerfLogEvent) -> Result<()> {
         let graphql_asts = setup_event.time("parse_sources_time", || {
             GraphQLAsts::from_graphql_sources_map(
                 &self.compiler_state.graphql_sources,
-                &self.compiler_state.dirty_definitions,
+                &self.compiler_state.get_dirty_defintions(&self.config),
             )
         })?;
         let mut check_project_errors = vec![];

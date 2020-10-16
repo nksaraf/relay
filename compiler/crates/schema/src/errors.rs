@@ -6,7 +6,7 @@
  */
 
 use crate::definitions::Type;
-use graphql_syntax::type_system_node::OperationType;
+use graphql_syntax::OperationType;
 use interner::StringKey;
 use thiserror::Error;
 

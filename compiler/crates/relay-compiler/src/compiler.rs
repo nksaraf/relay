@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::errors::{BuildProjectError, Error, Result};
 use crate::graphql_asts::GraphQLAsts;
 use crate::{source_for_location, watchman::FileSource};
-use common::{Diagnostic, PerfLogEvent, PerfLogger};
+use common::{Diagnostic, DiagnosticsResult, PerfLogEvent, PerfLogger};
 use futures::future::join_all;
 use graphql_cli::DiagnosticPrinter;
 use log::{error, info};
@@ -47,9 +47,6 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
             .await?;
 
         self.perf_logger.complete_event(setup_event);
-
-        self.config.artifact_writer.finalize()?;
-
         Ok(compiler_state)
     }
 
@@ -57,15 +54,15 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
         &self,
         compiler_state: &CompilerState,
         setup_event: &impl PerfLogEvent,
-    ) -> HashMap<ProjectName, Arc<Schema>> {
+    ) -> DiagnosticsResult<HashMap<ProjectName, Arc<Schema>>> {
         let timer = setup_event.start("build_schemas");
         let mut schemas = HashMap::new();
         for project_config in self.config.enabled_projects() {
-            let schema = build_schema(compiler_state, project_config);
+            let schema = build_schema(compiler_state, project_config)?;
             schemas.insert(project_config.name, Arc::new(schema));
         }
         setup_event.stop(timer);
-        schemas
+        Ok(schemas)
     }
 
     pub async fn watch(&self) -> Result<()> {
@@ -99,7 +96,6 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
                 // TODO Single change to file in VSCode sometimes produces
                 // 2 watchman change events for the same file
 
-                info!("Change detected.");
                 let had_new_changes = compiler_state.merge_file_source_changes(
                     &self.config,
                     &file_source_changes,
@@ -109,7 +105,7 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
                 )?;
 
                 if had_new_changes {
-                    info!("Start compiling...");
+                    info!("Change detected, start compiling...");
                     if self
                         .build_projects(&mut compiler_state, &incremental_build_event)
                         .await
@@ -120,15 +116,14 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
                         info!("Compilation completed.");
                     }
                     incremental_build_event.stop(incremental_build_time);
+                    info!("Waiting for changes...");
                 } else {
                     incremental_build_event.stop(incremental_build_time);
-                    info!("No compilation required.");
                 }
                 self.perf_logger.complete_event(incremental_build_event);
                 // We probably don't want the messages queue to grow indefinitely
                 // and we need to flush then, as the check/build is completed
                 self.perf_logger.flush();
-                info!("Waiting for changes...");
             }
         }
     }
@@ -148,6 +143,14 @@ impl<TPerfLogger: PerfLogger> Compiler<TPerfLogger> {
         match result {
             Ok(()) => {
                 compiler_state.complete_compilation();
+                self.config.artifact_writer.finalize()?;
+                if let Some(post_artifacts_write) = &self.config.post_artifacts_write {
+                    if let Err(error) = post_artifacts_write(&self.config) {
+                        let error = Error::PostArtifactsError { error };
+                        error!("{}", error);
+                        return Err(error);
+                    }
+                }
                 Ok(())
             }
             Err(error) => {
@@ -207,13 +210,20 @@ async fn build_projects<TPerfLogger: PerfLogger + 'static>(
     let mut graphql_asts = setup_event.time("parse_sources_time", || {
         GraphQLAsts::from_graphql_sources_map(
             &compiler_state.graphql_sources,
-            &compiler_state.dirty_definitions,
+            &compiler_state.get_dirty_defintions(&config),
         )
     })?;
 
     let build_results: Vec<_> = config
         .par_enabled_projects()
-        .filter(|project_config| compiler_state.project_has_pending_changes(project_config.name))
+        .filter(|project_config| {
+            if let Some(base) = project_config.base {
+                if compiler_state.project_has_pending_changes(base) {
+                    return true;
+                }
+            }
+            compiler_state.project_has_pending_changes(project_config.name)
+        })
         .map(|project_config| {
             build_project(
                 &config,
@@ -247,6 +257,11 @@ async fn build_projects<TPerfLogger: PerfLogger + 'static>(
                 .remove(&project_name)
                 .expect("Expect GraphQLAsts to exist.")
                 .removed_definition_names;
+            let dirty_artifact_paths = compiler_state
+                .dirty_artifact_paths
+                .get(&project_name)
+                .cloned()
+                .unwrap_or_default();
             handles.push(task::spawn(async move {
                 let project_config = &config.projects[&project_name];
                 Ok((
@@ -260,13 +275,18 @@ async fn build_projects<TPerfLogger: PerfLogger + 'static>(
                         artifacts,
                         artifact_map,
                         removed_definition_names,
+                        dirty_artifact_paths,
                     )
                     .await?,
                 ))
             }));
         }
         for commit_result in join_all(handles).await {
-            match commit_result.unwrap() {
+            let commit_result: std::result::Result<std::result::Result<_, _>, _> = commit_result;
+            let inner_result = commit_result.map_err(|e| Error::JoinError {
+                error: e.to_string(),
+            })?;
+            match inner_result {
                 Ok((project_name, next_artifact_map)) => {
                     let next_artifact_map = Arc::new(ArtifactMapKind::Mapping(next_artifact_map));
                     compiler_state

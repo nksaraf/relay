@@ -6,10 +6,12 @@
  */
 
 use crate::{
-    config::{ArtifactPersister, PersistConfig},
+    config::Config,
+    config::{OperationPersister, PersistConfig},
     errors::BuildProjectError,
     Artifact, ArtifactContent,
 };
+use common::PerfLogEvent;
 use lazy_static::lazy_static;
 use log::debug;
 use md5::{Digest, Md5};
@@ -25,30 +27,47 @@ pub async fn persist_operations(
     artifacts: &mut [Artifact],
     root_dir: &PathBuf,
     persist_config: &PersistConfig,
-    artifact_persister: &Box<dyn ArtifactPersister + Send + Sync>,
+    config: &Config,
+    operation_persister: &Box<dyn OperationPersister + Send + Sync>,
+    log_event: &impl PerfLogEvent,
 ) -> Result<(), BuildProjectError> {
-    let handles = artifacts.iter_mut().map(|artifact| async move {
-        if let ArtifactContent::Operation {
-            ref text,
-            ref mut id_and_text_hash,
-            ..
-        } = artifact.content
-        {
-            let text_hash = md5(text);
-            let path = root_dir.join(&artifact.path);
-            let persist_id = if let Some(extracted_id) = extract_persist_id(&path, &text_hash) {
-                extracted_id
+    let handles = artifacts
+        .iter_mut()
+        .flat_map(|artifact| {
+            if let ArtifactContent::Operation {
+                ref text,
+                ref mut id_and_text_hash,
+                ..
+            } = artifact.content
+            {
+                let text_hash = md5(text);
+                let artifact_path = root_dir.join(&artifact.path);
+                let extracted_persist_id = if config.repersist_operations {
+                    None
+                } else {
+                    extract_persist_id(&artifact_path, &text_hash)
+                };
+                if let Some(id) = extracted_persist_id {
+                    *id_and_text_hash = Some((id, text_hash));
+                    None
+                } else {
+                    let text = text.clone();
+                    Some(async move {
+                        operation_persister
+                            .persist_artifact(text, persist_config)
+                            .await
+                            .map(|id| {
+                                *id_and_text_hash = Some((id, text_hash));
+                            })
+                    })
+                }
             } else {
-                artifact_persister
-                    .persist_artifact(text, persist_config)
-                    .await?
-            };
-            *id_and_text_hash = Some((persist_id, text_hash));
-        }
-        Ok(())
-    });
-
-    debug!("persisting {} documents", handles.len());
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    log_event.number("persist_documents", handles.len());
+    log_event.number("worker_count", operation_persister.worker_count());
     let results = futures::future::join_all(handles).await;
     debug!("done persisting");
     let errors = results

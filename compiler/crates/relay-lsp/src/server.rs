@@ -5,14 +5,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::lsp::{
-    Completion, CompletionOptions, Connection, DidChangeTextDocument, DidCloseTextDocument,
-    DidOpenTextDocument, InitializeParams, LSPBridgeMessage, Message, Notification, Request,
-    ServerCapabilities, ServerNotification, ServerRequest, ServerRequestId,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
+use crate::{
+    error::LSPError,
+    lsp::{
+        Connection, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        InitializeParams, LSPBridgeMessage, Message, Notification, Request, ServerCapabilities,
+        ServerNotification, ServerRequest, ServerRequestId, TextDocumentSyncCapability,
+        TextDocumentSyncKind,
+    },
 };
 
-use relay_compiler::FileSource;
+use relay_compiler::{errors::Error::DiagnosticsError, FileSource};
 
 use relay_compiler::config::Config;
 
@@ -38,6 +41,7 @@ pub fn initialize(connection: &Connection) -> Result<InitializeParams> {
     server_capabilities.text_document_sync =
         Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::Full));
 
+    /* TODO: Re-enable auto-complete
     server_capabilities.completion_provider = Some(CompletionOptions {
         resolve_provider: Some(true),
         trigger_characters: None,
@@ -45,6 +49,7 @@ pub fn initialize(connection: &Connection) -> Result<InitializeParams> {
             work_done_progress: None,
         },
     });
+    */
 
     let server_capabilities = serde_json::to_value(&server_capabilities)?;
     let params = connection.initialize(server_capabilities)?;
@@ -54,7 +59,7 @@ pub fn initialize(connection: &Connection) -> Result<InitializeParams> {
 
 /// Run the main server loop
 pub async fn run(connection: Connection, _params: InitializeParams) -> Result<()> {
-    show_info_message("Relay Language Server Started!", &connection)?;
+    show_info_message("Relay Language Server Started", &connection)?;
     info!("Running language server");
 
     let receiver = connection.receiver.clone();
@@ -72,7 +77,8 @@ pub async fn run(connection: Connection, _params: InitializeParams) -> Result<()
         // Cache for the extracted GraphQL sources
         for msg in receiver {
             match msg {
-                Message::Request(req) => {
+                Message::Request(_) => {
+                    /* TODO: Re-enable auto-complete
                     // Auto-complete request
                     if req.method == Completion::METHOD {
                         let (request_id, params) = extract_request_params::<Completion>(req);
@@ -81,6 +87,7 @@ pub async fn run(connection: Connection, _params: InitializeParams) -> Result<()
                             .await
                             .ok();
                     }
+                    */
                 }
                 Message::Notification(notif) => {
                     match &notif.method {
@@ -122,8 +129,9 @@ pub async fn run(connection: Connection, _params: InitializeParams) -> Result<()
     });
 
     info!("Waiting for compiler to initialize...");
-
     compiler_notify.notified().await;
+    info!("Compiler has initialized");
+
     let config = load_config();
     let setup_event = ConsoleLogger.create_event("lsp_compiler_setup");
     let file_source = FileSource::connect(&config, &setup_event).await?;
@@ -131,7 +139,8 @@ pub async fn run(connection: Connection, _params: InitializeParams) -> Result<()
         .subscribe(&setup_event, &ConsoleLogger)
         .await
         .unwrap();
-    let schemas = LSPCompiler::build_schemas(&config, &compiler_state, &setup_event);
+    let schemas = LSPCompiler::build_schemas(&config, &compiler_state, &setup_event)
+        .map_err(|errors| LSPError::CompilerError(DiagnosticsError { errors }))?;
     let mut lsp_compiler = LSPCompiler::new(
         &schemas,
         &config,
@@ -148,7 +157,7 @@ fn load_config() -> Config {
     // TODO(brandondail) don't hardcode the test project config here
     let home = std::env::var("HOME").unwrap();
     let config_path = PathBuf::from(format!(
-        "{}/fbsource/fbcode/relay/config/config.test.json",
+        "{}/fbsource/fbcode/relay/config/config.example.json",
         home
     ));
     let config = Config::load(config_path).unwrap();
@@ -162,6 +171,7 @@ where
     notif.extract(N::METHOD).unwrap()
 }
 
+#[allow(dead_code)]
 fn extract_request_params<R>(req: ServerRequest) -> (ServerRequestId, R::Params)
 where
     R: Request,
