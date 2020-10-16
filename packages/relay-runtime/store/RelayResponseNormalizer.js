@@ -488,7 +488,7 @@ class RelayResponseNormalizer {
       RelayModernRecord.setValue(record, storageKey, fieldValue);
     } else if (selection.kind === LINKED_FIELD) {
       this._path.push(responseKey);
-      if (selection.plural) {
+      if (selection.plural || Array.isArray(fieldValue)) {
         this._normalizePluralLink(selection, record, storageKey, fieldValue);
       } else {
         this._normalizeLink(selection, record, storageKey, fieldValue);
