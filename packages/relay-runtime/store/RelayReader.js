@@ -36,6 +36,8 @@ const {
   FRAGMENTS_KEY,
   FRAGMENT_OWNER_KEY,
   FRAGMENT_PROP_NAME_KEY,
+  REF_KEY,
+  REFS_KEY,
   ID_KEY,
   IS_WITHIN_UNMATCHED_TYPE_REFINEMENT,
   MODULE_COMPONENT_KEY,
@@ -254,11 +256,8 @@ class RelayReader {
           this._readScalar(selection, record, data);
           break;
         case LINKED_FIELD:
-          if (selection.plural) {
-            this._readPluralLink(selection, record, data);
-          } else {
-            this._readLink(selection, record, data);
-          }
+          this._readLinkedField(selection, record, data);
+
           break;
         case CONDITION:
           const conditionValue = this._getVariableValue(selection.condition);
@@ -453,6 +452,31 @@ class RelayReader {
     }
     data[applicationName] = value;
     return value;
+  }
+
+  _readLinkedField(
+    field: ReaderLinkedField,
+    record: Record,
+    data: SelectorData,
+  ): ?mixed {
+    const applicationName = field.alias ?? field.name;
+    const storageKey = getStorageKey(field, this._variables);
+
+    const value = record[storageKey];
+
+    if (value == null) {
+      data[applicationName] = value;
+      if (value === undefined) {
+        this._isMissingData = true;
+      }
+      return value;
+    }
+
+    if (field.plural || REFS_KEY in value) {
+      return this._readPluralLink(field, record, data);
+    } else {
+      return this._readLink(field, record, data);
+    }
   }
 
   _readLink(
